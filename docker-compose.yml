@@ -1,0 +1,14 @@
+services:
+  mcp-memory-server:
+    build: .
+    container_name: mcp-memory-server
+    ports:
+      - "9393:9393"
+    volumes:
+      - ./data:/data
+    environment:
+      - PYTHONUNBUFFERED=1
+    restart: unless-stopped
+
+volumes:
+  mcp-memory-server:
