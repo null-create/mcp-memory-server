@@ -1,23 +1,32 @@
 """
 MCP Server for Long-term Memory Storage with HTTP API
-Uses TinyDB (NoSQL) to store and retrieve memories for LLM conversations
+Uses TinyDB (NoSQL) and FastMCP for tool management
 """
 
 import json
+import logging
 import asyncio
+import argparse
 from datetime import datetime
-from typing import Any, Optional
+from typing import Optional
 from pathlib import Path
 
-from mcp.server import Server
-from mcp.types import Tool, TextContent
+from mcp.server.fastmcp import FastMCP
 from tinydb import TinyDB, Query
 from tinydb.storages import JSONStorage
 from tinydb.middlewares import CachingMiddleware
 from aiohttp import web
 
-# Initialize MCP server
-app = Server("memory-server")
+# Server configs
+HOST_ADDR = "0.0.0.0"
+HOST_PORT = 9321
+
+# Set up logging
+logging.basicConfig(level="INFO")
+logger = logging.getLogger(__file__)
+
+# Initialize FastMCP server
+mcp = FastMCP(name="memory-server", host=HOST_ADDR, port=HOST_PORT)
 
 # Database setup
 DB_PATH = Path("/data/memory_bank.json")
@@ -27,7 +36,23 @@ memories_table = db.table("memories")
 Memory = Query()
 
 
-# Helper functions
+# Parse args
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser("Memory MCP Server")
+    parser.add_argument(
+        "--http",
+        action="store_true",
+        help="Whether to run in http server mode (defaults to running MCP server directly)",
+        default=False,
+    )
+    return parser.parse_args()
+
+
+# ============================================================================
+# Database Helper Functions
+# ============================================================================
+
+
 def create_memory(content: str, tags: list[str] = None, metadata: dict = None) -> dict:
     """Create a new memory entry"""
     memory = {
@@ -39,7 +64,8 @@ def create_memory(content: str, tags: list[str] = None, metadata: dict = None) -
         "last_accessed": None,
     }
     memory_id = memories_table.insert(memory)
-    return {"id": memory_id, **memory}
+    memory["id"] = memory_id
+    return memory
 
 
 def search_memories(
@@ -55,7 +81,9 @@ def search_memories(
     else:
         results = memories_table.all()
 
+    # Add IDs and update access count
     for memory in results[:limit]:
+        memory["id"] = memory.doc_id
         memories_table.update(
             {
                 "access_count": memory.get("access_count", 0) + 1,
@@ -71,6 +99,7 @@ def get_memory_by_id(memory_id: int) -> Optional[dict]:
     """Retrieve a specific memory by ID"""
     memory = memories_table.get(doc_id=memory_id)
     if memory:
+        memory["id"] = memory_id
         memories_table.update(
             {
                 "access_count": memory.get("access_count", 0) + 1,
@@ -107,6 +136,8 @@ def delete_memory(memory_id: int) -> bool:
 def get_recent_memories(limit: int = 10) -> list[dict]:
     """Get most recently created memories"""
     all_memories = memories_table.all()
+    for memory in all_memories:
+        memory["id"] = memory.doc_id
     sorted_memories = sorted(
         all_memories, key=lambda x: x.get("timestamp", ""), reverse=True
     )
@@ -116,6 +147,8 @@ def get_recent_memories(limit: int = 10) -> list[dict]:
 def get_frequent_memories(limit: int = 10) -> list[dict]:
     """Get most frequently accessed memories"""
     all_memories = memories_table.all()
+    for memory in all_memories:
+        memory["id"] = memory.doc_id
     sorted_memories = sorted(
         all_memories, key=lambda x: x.get("access_count", 0), reverse=True
     )
@@ -140,10 +173,186 @@ def get_stats() -> dict:
     }
 
 
-# HTTP API handlers
+def get_all_tags() -> list[str]:
+    """Get all unique tags"""
+    all_memories = memories_table.all()
+    all_tags = set()
+    for memory in all_memories:
+        all_tags.update(memory.get("tags", []))
+    return sorted(list(all_tags))
+
+
+# ============================================================================
+# MCP Tools using @mcp.tool decorator
+# ============================================================================
+
+
+@mcp.tool()
+def store_memory(content: str, tags: list[str] = None, metadata: dict = None) -> str:
+    """
+    Store a new memory in the long-term memory bank.
+
+    Args:
+        content: The memory content to store
+        tags: Optional list of tags to categorize the memory (e.g., 'user_preference', 'fact', 'conversation')
+        metadata: Optional metadata dictionary for additional context
+
+    Returns:
+        JSON string with the stored memory including its ID
+    """
+    memory = create_memory(content, tags, metadata)
+    return json.dumps(memory, indent=2)
+
+
+@mcp.tool()
+def search_memory(query: str = None, tags: list[str] = None, limit: int = 10) -> str:
+    """
+    Search for memories by keyword or tags.
+
+    Args:
+        query: Search query to find in memory content
+        tags: List of tags to filter memories by
+        limit: Maximum number of memories to return (default: 10)
+
+    Returns:
+        JSON string with found memories
+    """
+    results = search_memories(query, tags, limit)
+    if results:
+        return json.dumps({"count": len(results), "memories": results}, indent=2)
+    return json.dumps(
+        {"count": 0, "message": "No memories found matching the criteria"}
+    )
+
+
+@mcp.tool()
+def get_memory(memory_id: int) -> str:
+    """
+    Retrieve a specific memory by its ID.
+
+    Args:
+        memory_id: The ID of the memory to retrieve
+
+    Returns:
+        JSON string with the memory or error message
+    """
+    memory = get_memory_by_id(memory_id)
+    if memory:
+        return json.dumps(memory, indent=2)
+    return json.dumps({"error": f"Memory with ID {memory_id} not found"})
+
+
+@mcp.tool()
+def update_memory_content(
+    memory_id: int, content: str = None, tags: list[str] = None, metadata: dict = None
+) -> str:
+    """
+    Update an existing memory's content, tags, or metadata.
+
+    Args:
+        memory_id: The ID of the memory to update
+        content: New content for the memory (optional)
+        tags: New tags for the memory (optional)
+        metadata: New metadata for the memory (optional)
+
+    Returns:
+        JSON string with success status
+    """
+    success = update_memory(memory_id, content, tags, metadata)
+    if success:
+        return json.dumps(
+            {"success": True, "message": f"Memory {memory_id} updated successfully"}
+        )
+    return json.dumps(
+        {"success": False, "error": f"Failed to update memory {memory_id}"}
+    )
+
+
+@mcp.tool()
+def delete_memory_by_id(memory_id: int) -> str:
+    """
+    Delete a memory from the memory bank.
+
+    Args:
+        memory_id: The ID of the memory to delete
+
+    Returns:
+        JSON string with success status
+    """
+    success = delete_memory(memory_id)
+    if success:
+        return json.dumps(
+            {"success": True, "message": f"Memory {memory_id} deleted successfully"}
+        )
+    return json.dumps(
+        {"success": False, "error": f"Failed to delete memory {memory_id}"}
+    )
+
+
+@mcp.tool()
+def get_recent_memory_list(limit: int = 10) -> str:
+    """
+    Get the most recently stored memories.
+
+    Args:
+        limit: Maximum number of memories to return (default: 10)
+
+    Returns:
+        JSON string with recent memories
+    """
+    memories = get_recent_memories(limit)
+    return json.dumps({"count": len(memories), "memories": memories}, indent=2)
+
+
+@mcp.tool()
+def get_frequent_memory_list(limit: int = 10) -> str:
+    """
+    Get the most frequently accessed memories.
+
+    Args:
+        limit: Maximum number of memories to return (default: 10)
+
+    Returns:
+        JSON string with frequently accessed memories
+    """
+    memories = get_frequent_memories(limit)
+    return json.dumps({"count": len(memories), "memories": memories}, indent=2)
+
+
+@mcp.tool()
+def list_all_tags() -> str:
+    """
+    Get a list of all unique tags used in memories.
+
+    Returns:
+        JSON string with all tags
+    """
+    tags = get_all_tags()
+    return json.dumps({"count": len(tags), "tags": tags}, indent=2)
+
+
+@mcp.tool()
+def get_memory_stats() -> str:
+    """
+    Get statistics about the memory bank.
+
+    Returns:
+        JSON string with memory bank statistics
+    """
+    stats = get_stats()
+    return json.dumps(stats, indent=2)
+
+
+# ============================================================================
+# HTTP API Handlers
+# ============================================================================
+
+
 async def health_check(request):
     """Health check endpoint"""
-    return web.json_response({"status": "healthy", "service": "mcp-memory-server"})
+    return web.json_response(
+        {"status": "healthy", "service": "mcp-memory-server", "version": "2.0-fastmcp"}
+    )
 
 
 async def api_store_memory(request):
@@ -221,14 +430,11 @@ async def api_get_stats(request):
 
 async def api_get_tags(request):
     """Get all tags"""
-    all_memories = memories_table.all()
-    all_tags = set()
-    for memory in all_memories:
-        all_tags.update(memory.get("tags", []))
-    return web.json_response({"tags": sorted(list(all_tags))})
+    tags = get_all_tags()
+    return web.json_response({"tags": tags})
 
 
-def create_http_app() -> web.Application:
+def create_http_app():
     """Create the HTTP API application"""
     http_app = web.Application()
 
@@ -247,77 +453,13 @@ def create_http_app() -> web.Application:
     return http_app
 
 
-# MCP Tool Handlers
-@app.list_tools()
-async def list_tools() -> list[Tool]:
-    """List available memory tools"""
-    return [
-        Tool(
-            name="store_memory",
-            description="Store a new memory in the long-term memory bank",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "content": {"type": "string", "description": "The memory content"},
-                    "tags": {"type": "array", "items": {"type": "string"}},
-                    "metadata": {"type": "object"},
-                },
-                "required": ["content"],
-            },
-        ),
-        Tool(
-            name="search_memories",
-            description="Search for memories by keyword or tags",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "query": {"type": "string"},
-                    "tags": {"type": "array", "items": {"type": "string"}},
-                    "limit": {"type": "integer", "default": 10},
-                },
-            },
-        ),
-        Tool(
-            name="get_memory",
-            description="Retrieve a specific memory by ID",
-            inputSchema={
-                "type": "object",
-                "properties": {"memory_id": {"type": "integer"}},
-                "required": ["memory_id"],
-            },
-        ),
-    ]
+# ============================================================================
+# Main Web Application
+# ============================================================================
 
 
-@app.call_tool()
-async def call_tool(name: str, arguments: Any) -> list[TextContent]:
-    """Handle tool calls"""
-    if name == "store_memory":
-        memory = create_memory(
-            content=arguments["content"],
-            tags=arguments.get("tags"),
-            metadata=arguments.get("metadata"),
-        )
-        return [TextContent(type="text", text=json.dumps(memory, indent=2))]
-
-    elif name == "search_memories":
-        results = search_memories(
-            query=arguments.get("query"),
-            tags=arguments.get("tags"),
-            limit=arguments.get("limit", 10),
-        )
-        return [TextContent(type="text", text=json.dumps(results, indent=2))]
-
-    elif name == "get_memory":
-        memory = get_memory_by_id(arguments["memory_id"])
-        return [TextContent(type="text", text=json.dumps(memory, indent=2))]
-
-    return [TextContent(type="text", text=f"Unknown tool: {name}")]
-
-
-async def main() -> None:
-    """Run both HTTP API and MCP server"""
-    # Start HTTP server
+async def run_http_server():
+    """Run HTTP API server"""
     http_app = create_http_app()
     runner = web.AppRunner(http_app)
     await runner.setup()
@@ -327,7 +469,8 @@ async def main() -> None:
     print("🚀 MCP Memory Server started!")
     print("📡 HTTP API: http://localhost:9393")
     print("💾 Database: /data/memory_bank.json")
-    print("\nAvailable endpoints:")
+    print("🔧 MCP Tools: 9 tools registered via FastMCP")
+    print("\nAvailable HTTP endpoints:")
     print("  GET  /health - Health check")
     print("  GET  /stats - Memory statistics")
     print("  POST /memories - Create memory")
@@ -335,6 +478,24 @@ async def main() -> None:
     print("  GET  /memories/{id} - Get memory")
     print("  PUT  /memories/{id} - Update memory")
     print("  DELETE /memories/{id} - Delete memory")
+    print("\nMCP Tools available:")
+    print("  - store_memory")
+    print("  - search_memory")
+    print("  - get_memory")
+    print("  - update_memory_content")
+    print("  - delete_memory_by_id")
+    print("  - get_recent_memory_list")
+    print("  - get_frequent_memory_list")
+    print("  - list_all_tags")
+    print("  - get_memory_stats")
+
+    return runner
+
+
+async def run_http() -> None:
+    """Main entry point for http server"""
+    # Start HTTP server
+    runner = await run_http_server()
 
     # Keep server running
     try:
@@ -344,4 +505,9 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    args = parse_args()
+    if args.http:
+        run_http()
+    else:
+        logger.info(f"Starting MCP server at {HOST_ADDR}:{HOST_PORT}...")
+        mcp.run(transport="streamable-http")
