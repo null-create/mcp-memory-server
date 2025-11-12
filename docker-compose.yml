@@ -3,7 +3,7 @@ services:
     build: .
     container_name: mcp-memory-server
     ports:
-      - "9393:9393"
+      - "9321:9321"
     volumes:
       - ./data:/data
     environment:

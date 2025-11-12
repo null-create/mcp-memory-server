@@ -13,7 +13,7 @@ COPY server.py .
 RUN mkdir -p /data
 
 # Expose HTTP port
-EXPOSE 9393
+EXPOSE 9321
 
 # Run server
 CMD ["python", "server.py"]
