@@ -15,9 +15,6 @@ build/
 data/
 *.json
 
-# Docker
-.dockerignore
-
 # IDE
 .vscode/
 .idea/
@@ -26,6 +23,7 @@ data/
 
 # Misc
 .local
+.env
 
 # OS
 .DS_Store

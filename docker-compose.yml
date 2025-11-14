@@ -1,13 +1,13 @@
 services:
   mcp-memory-server:
-    build: .
+    build:
+      context: .
+      dockerfile: Dockerfile
     container_name: mcp-memory-server
     ports:
       - "9321:9321"
     volumes:
       - ./data:/data
-    environment:
-      - PYTHONUNBUFFERED=1
     restart: unless-stopped
 
 volumes:

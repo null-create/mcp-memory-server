@@ -9,7 +9,6 @@ clean:
 	$(info Cleaning project...)
 	rm -rf venv
 
-# Local development helpers
 dev-compose:
 	$(info Starting development environment...)
 	@docker-compose -f docker-compose.yml up -d --build
